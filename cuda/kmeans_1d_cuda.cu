@@ -1,20 +1,31 @@
 /* kmeans_1d_cuda.cu
-   K-means 1D com CUDA (GPU):
-   - Assignment: kernel parallelizado (1 thread por ponto)
-   - Update: Opção A - copiar assign para CPU, calcular médias no host
+   K-means 1D com paralelização CUDA (GPU):
+   - Assignment: paralelizado na GPU (1 thread por ponto)
+   - Update: feito na CPU (opção A simples)
+   - Medições de tempo com CUDA events
 
-   Compilar: nvcc -O2 kmeans_1d_cuda.cu -o kmeans_1d_cuda -lm
+   Compilar: nvcc -O2 kmeans_1d_cuda.cu -o kmeans_1d_cuda
    Uso:      ./kmeans_1d_cuda dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [block_size=256] [assign.csv] [centroids.csv]
-             block_size: 128, 256, 512
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
+#include <cuda_runtime.h>
 
-/* ---------- util CSV 1D: cada linha tem 1 número ---------- */
+/* ---------- Macro para verificação de erros CUDA ---------- */
+#define CUDA_CHECK(call) \
+do { \
+    cudaError_t err = call; \
+    if(err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error em %s:%d: %s\n", __FILE__, __LINE__, \
+                cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+/* ---------- util CSV 1D ---------- */
 static int count_rows(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -131,50 +142,39 @@ static void write_centroids_csv(const char *path, const double *C, int K)
     fclose(f);
 }
 
-/* ---------- CUDA kernels ---------- */
-/* Kernel de assignment: cada thread processa 1 ponto */
-__global__ void kernel_assignment(const double *X, const double *C, int *assign, 
-                                   double *sse_per_point, int N, int K)
+/* ---------- Kernel CUDA para Assignment ---------- */
+__global__ void assignment_kernel(const double *X, const double *C,
+                                   int *assign, double *errors,
+                                   int N, int K)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N)
-        return;
 
-    sse_per_point[i] = 0.0;
-
-    int best = 0;
-    double bestd = 1e300;
-
-    for (int c = 0; c < K; c++)
+    if (i < N)
     {
-        double diff = X[i] - C[c];
-        double d = diff * diff;
-        if (d < bestd)
+        int best = -1;
+        double bestd = 1e300;
+
+        for (int c = 0; c < K; c++)
         {
-            bestd = d;
-            best = c;
+            double diff = X[i] - C[c];
+            double d = diff * diff;
+            if (d < bestd)
+            {
+                bestd = d;
+                best = c;
+            }
         }
+
+        assign[i] = best;
+        errors[i] = bestd;
     }
-
-    assign[i] = best;
-    sse_per_point[i] = bestd;
 }
 
-/* ---------- CPU helper functions ---------- */
-static double reduce_sse_host(const double *sse_per_point, int N)
-{
-    double sse = 0.0;
-    for (int i = 0; i < N; i++)
-        sse += sse_per_point[i];
-    return sse;
-}
-
-static void update_step_host(const double *X, double *C, const int *assign, 
-                              int N, int K)
+/* ---------- Update step (CPU) ---------- */
+static void update_step_1d(const double *X, double *C, const int *assign, int N, int K)
 {
     double *sum = (double *)calloc((size_t)K, sizeof(double));
     int *cnt = (int *)calloc((size_t)K, sizeof(int));
-
     if (!sum || !cnt)
     {
         fprintf(stderr, "Sem memoria no update\n");
@@ -184,10 +184,9 @@ static void update_step_host(const double *X, double *C, const int *assign,
     for (int i = 0; i < N; i++)
     {
         int a = assign[i];
-        cnt[a]++;
+        cnt[a] += 1;
         sum[a] += X[i];
     }
-
     for (int c = 0; c < K; c++)
     {
         if (cnt[c] > 0)
@@ -195,97 +194,71 @@ static void update_step_host(const double *X, double *C, const int *assign,
         else
             C[c] = X[0];
     }
-
     free(sum);
     free(cnt);
 }
 
-/* ---------- K-means 1D com CUDA ---------- */
-static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_host,
-                           int N, int K, int max_iter, double eps, int block_size,
-                           int *iters_out, double *sse_out,
-                           double *time_h2d_out, double *time_kernel_out, 
-                           double *time_d2h_out)
+/* ---------- K-means com CUDA ---------- */
+static void kmeans_1d_cuda(const double *X, double *C, int *assign,
+                            int N, int K, int max_iter, double eps,
+                            int block_size, int *iters_out, double *sse_out,
+                            double *kernel_time_out, double *total_time_out)
 {
-    /* Alocação de memória na GPU */
-    double *X_dev, *C_dev, *sse_dev;
+    double *X_dev, *C_dev, *errors_dev;
     int *assign_dev;
 
-    cudaMalloc(&X_dev, N * sizeof(double));
-    cudaMalloc(&C_dev, K * sizeof(double));
-    cudaMalloc(&assign_dev, N * sizeof(int));
-    cudaMalloc(&sse_dev, N * sizeof(double));
+    CUDA_CHECK(cudaMalloc(&X_dev, N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&C_dev, K * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&assign_dev, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&errors_dev, N * sizeof(double)));
 
-    double *sse_zero = (double *)calloc(N, sizeof(double));
-    cudaMemcpy(sse_dev, sse_zero, N * sizeof(double), cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    free(sse_zero);
+    CUDA_CHECK(cudaMemcpy(X_dev, X, N * sizeof(double), cudaMemcpyHostToDevice));
 
-    double *sse_per_point = (double *)malloc(N * sizeof(double));
+    int grid_size = (N + block_size - 1) / block_size;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    double *errors_host = (double *)malloc(N * sizeof(double));
 
-    double total_h2d = 0.0, total_kernel = 0.0, total_d2h = 0.0;
+    cudaEvent_t start_total, stop_total, start_kernel, stop_kernel;
+    CUDA_CHECK(cudaEventCreate(&start_total));
+    CUDA_CHECK(cudaEventCreate(&stop_total));
+    CUDA_CHECK(cudaEventCreate(&start_kernel));
+    CUDA_CHECK(cudaEventCreate(&stop_kernel));
 
-    /* H2D: X (uma vez antes do loop) */
-    cudaEventRecord(start);
-    cudaMemcpy(X_dev, X_host, N * sizeof(double), cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms_h2d_x_initial;
-    cudaEventElapsedTime(&ms_h2d_x_initial, start, stop);
-    total_h2d += ms_h2d_x_initial;
+    CUDA_CHECK(cudaEventRecord(start_total));
 
     double prev_sse = 1e300;
     double sse = 0.0;
     int it;
+    float total_kernel_ms = 0.0f;
 
-    printf("\n--- SSE por iteração ---\n");
+    printf("\n--- SSE por iteração (CUDA) ---\n");
 
     for (it = 0; it < max_iter; it++)
     {
+        CUDA_CHECK(cudaMemcpy(C_dev, C, K * sizeof(double), cudaMemcpyHostToDevice));
 
-        /* H2D: C */
-        cudaEventRecord(start);
-        cudaMemcpy(C_dev, C_host, K * sizeof(double), cudaMemcpyHostToDevice);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_h2d_c;
-        cudaEventElapsedTime(&ms_h2d_c, start, stop);
-        total_h2d += ms_h2d_c;
+        CUDA_CHECK(cudaEventRecord(start_kernel));
+        assignment_kernel<<<grid_size, block_size>>>(X_dev, C_dev, assign_dev, errors_dev, N, K);
+        CUDA_CHECK(cudaEventRecord(stop_kernel));
+        CUDA_CHECK(cudaEventSynchronize(stop_kernel));
 
-        /* Zerar sse_dev ANTES de cada kernel */
-        cudaMemset(sse_dev, 0, N * sizeof(double));
-        cudaDeviceSynchronize();
+        float kernel_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start_kernel, stop_kernel));
+        total_kernel_ms += kernel_ms;
 
-        /* Kernel: assignment */
-        int grid_size = (N + block_size - 1) / block_size;
-        cudaEventRecord(start);
-        kernel_assignment<<<grid_size, block_size>>>(X_dev, C_dev, assign_dev, sse_dev, N, K);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_kernel;
-        cudaEventElapsedTime(&ms_kernel, start, stop);
-        total_kernel += ms_kernel;
+        CUDA_CHECK(cudaGetLastError());
 
-        /* D2H: assign e sse */
-        cudaEventRecord(start);
-        cudaMemcpy(assign_host, assign_dev, N * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(sse_per_point, sse_dev, N * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_d2h;
-        cudaEventElapsedTime(&ms_d2h, start, stop);
-        total_d2h += ms_d2h;
+        CUDA_CHECK(cudaMemcpy(assign, assign_dev, N * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(errors_host, errors_dev, N * sizeof(double), cudaMemcpyDeviceToHost));
 
-        /* Redução SSE no host */
-        sse = reduce_sse_host(sse_per_point, N);
+        sse = 0.0;
+        for (int i = 0; i < N; i++)
+        {
+            sse += errors_host[i];
+        }
+
         printf("Iteração %d: SSE = %.6f\n", it + 1, sse);
 
-        /* Verificar convergência */
         double rel = fabs(sse - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
         if (rel < eps)
         {
@@ -294,27 +267,32 @@ static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_hos
             break;
         }
 
-        /* Update no host */
-        update_step_host((const double *)X_host, C_host, (const int *)assign_host, N, K);
+        update_step_1d(X, C, assign, N, K);
         prev_sse = sse;
     }
 
-    printf("------------------------\n\n");
+    printf("----------------------------\n\n");
+
+    CUDA_CHECK(cudaEventRecord(stop_total));
+    CUDA_CHECK(cudaEventSynchronize(stop_total));
+
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start_total, stop_total));
 
     *iters_out = it;
     *sse_out = sse;
-    *time_h2d_out = total_h2d;
-    *time_kernel_out = total_kernel;
-    *time_d2h_out = total_d2h;
+    *kernel_time_out = (double)total_kernel_ms;
+    *total_time_out = (double)total_ms;
 
-    /* Limpeza GPU */
-    cudaFree(X_dev);
-    cudaFree(C_dev);
-    cudaFree(assign_dev);
-    cudaFree(sse_dev);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    free(sse_per_point);
+    free(errors_host);
+    CUDA_CHECK(cudaFree(X_dev));
+    CUDA_CHECK(cudaFree(C_dev));
+    CUDA_CHECK(cudaFree(assign_dev));
+    CUDA_CHECK(cudaFree(errors_dev));
+    CUDA_CHECK(cudaEventDestroy(start_total));
+    CUDA_CHECK(cudaEventDestroy(stop_total));
+    CUDA_CHECK(cudaEventDestroy(start_kernel));
+    CUDA_CHECK(cudaEventDestroy(stop_kernel));
 }
 
 /* ---------- main ---------- */
@@ -324,7 +302,6 @@ int main(int argc, char **argv)
     {
         printf("Uso: %s dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [block_size=256] [assign.csv] [centroids.csv]\n", argv[0]);
         printf("Obs: arquivos CSV com 1 coluna (1 valor por linha), sem cabeçalho.\n");
-        printf("     block_size: 128, 256, 512 (padrão 256)\n");
         return 1;
     }
 
@@ -333,20 +310,12 @@ int main(int argc, char **argv)
     int max_iter = (argc > 3) ? atoi(argv[3]) : 50;
     double eps = (argc > 4) ? atof(argv[4]) : 1e-4;
     int block_size = (argc > 5) ? atoi(argv[5]) : 256;
-
     const char *outAssign = (argc > 6) ? argv[6] : NULL;
     const char *outCentroid = (argc > 7) ? argv[7] : NULL;
 
-    if (max_iter <= 0 || eps <= 0.0)
+    if (max_iter <= 0 || eps <= 0.0 || block_size <= 0)
     {
-        fprintf(stderr, "Parâmetros inválidos: max_iter>0 e eps>0\n");
-        return 1;
-    }
-
-    /* Validar block_size */
-    if (block_size != 128 && block_size != 256 && block_size != 512)
-    {
-        fprintf(stderr, "Block size deve ser 128, 256 ou 512\n");
+        fprintf(stderr, "Parâmetros inválidos: max_iter>0, eps>0, block_size>0\n");
         return 1;
     }
 
@@ -354,7 +323,6 @@ int main(int argc, char **argv)
     double *X = read_csv_1col(pathX, &N);
     double *C = read_csv_1col(pathC, &K);
     int *assign = (int *)malloc((size_t)N * sizeof(int));
-
     if (!assign)
     {
         fprintf(stderr, "Sem memoria para assign\n");
@@ -363,30 +331,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    cudaSetDevice(0);
-
-    double t0 = (double)clock() / CLOCKS_PER_SEC;
     int iters = 0;
     double sse = 0.0;
-    double time_h2d = 0.0, time_kernel = 0.0, time_d2h = 0.0;
+    double kernel_time = 0.0;
+    double total_time = 0.0;
 
-    kmeans_1d_cuda(X, C, assign, N, K, max_iter, eps, block_size,
-                   &iters, &sse, &time_h2d, &time_kernel, &time_d2h);
-
-    double t1 = (double)clock() / CLOCKS_PER_SEC;
-    double ms_total = 1000.0 * (t1 - t0);
+    kmeans_1d_cuda(X, C, assign, N, K, max_iter, eps, block_size, &iters, &sse, &kernel_time, &total_time);
 
     printf("=== K-means 1D (CUDA - GPU) ===\n");
     printf("N=%d K=%d max_iter=%d eps=%g\n", N, K, max_iter, eps);
     printf("Block size: %d | Grid size: %d\n", block_size, (N + block_size - 1) / block_size);
-    printf("Iterações: %d | SSE final: %.6f\n", iters, sse);
-    printf("\nTempo por componente:\n");
-    printf("  H2D (Host→Device): %.2f ms\n", time_h2d);
-    printf("  Kernel (Assignment): %.2f ms\n", time_kernel);
-    printf("  D2H (Device→Host): %.2f ms\n", time_d2h);
-    printf("  Tempo total (wallclock): %.1f ms\n", ms_total);
-    printf("  Throughput: %.2f Mpontos/s\n", (double)N * iters / (ms_total / 1000.0) / 1e6);
-    printf("================================\n");
+    printf("Iterações: %d | SSE final: %.6f | Tempo: %.1f ms\n", iters, sse, total_time);
+    printf("Tempo kernel: %.1f ms (%.1f%%)\n", kernel_time, 100.0 * kernel_time / total_time);
+    printf("===============================\n");
 
     write_assign_csv(outAssign, assign, N);
     write_centroids_csv(outCentroid, C, K);

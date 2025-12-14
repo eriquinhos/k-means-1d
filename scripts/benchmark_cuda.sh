@@ -1,7 +1,7 @@
 #!/bin/bash
 # Benchmark da versão CUDA
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 CUDA_BIN="$PROJECT_ROOT/cuda/kmeans_1d_cuda"
@@ -33,8 +33,8 @@ for DATA in "pequeno" "medio" "grande"; do
     
     for BS in "${BLOCK_SIZES[@]}"; do
         echo "  Block size: $BS"
-        $CUDA_BIN "$DATA_DIR/dados_$DATA.csv" "$DATA_DIR/dados_${DATA}_centroides_init.csv" \
-                  $MAX_ITER $EPS $BS 2>&1 | grep -E "(Block size|Iterações|H2D|Kernel|D2H|Tempo total|Throughput)"
+        "$CUDA_BIN" "$DATA_DIR/dados_$DATA.csv" "$DATA_DIR/dados_${DATA}_centroides_init.csv" \
+                  $MAX_ITER $EPS $BS "/tmp/assign_cuda.csv" "/tmp/centroids_cuda.csv" 2>&1
         echo ""
     done
     
