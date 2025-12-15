@@ -827,16 +827,6 @@ Para adicionar novas implementações ou otimizações:
 Este projeto é material educacional para a disciplina **Programação Concorrente e Distribuída** da [Instituição/Universidade].
 
 Você é livre para estudar, modificar e distribuir este código para fins educacionais. Para uso comercial, consulte a licença completa em `LICENSE`.
-
----
-
-## 👥 Autores
-
-Desenvolvido como trabalho acadêmico em Programação Concorrente e Distribuída.
-
-**Contribuidores:**
-- [Seu Nome] - [Papel/Paradigma]
-
 ---
 
 ## 📝 Notas Finais
